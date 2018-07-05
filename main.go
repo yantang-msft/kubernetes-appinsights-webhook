@@ -12,6 +12,7 @@ import (
 
 	"github.com/golang/glog"
 	"k8s.io/api/admission/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -24,8 +25,8 @@ const (
          { "op": "add", "path": "/data/mutation-stage-2", "value": "yes" }
      ]`
 	addInitContainerPatch string = `[
-		 {"op":"add","path":"/spec/initContainers","value":[{"image":"webhook-added-image","name":"webhook-added-init-container","resources":{}}]}
-	]`
+         {"op":"add","path":"/spec/initContainers","value":[{"image":"webhook-added-image","name":"webhook-added-init-container","resources":{}}]}
+    ]`
 )
 
 // Config contains the server (the webhook) cert and key.
@@ -33,6 +34,10 @@ type Config struct {
 	CertFile string
 	KeyFile  string
 }
+
+var (
+	IKeys map[metav1.LabelSelector]string
+)
 
 func (c *Config) addFlags() {
 	flag.StringVar(&c.CertFile, "tls-cert-file", c.CertFile, "File containing the default x509 Certificate for HTTPS. (CA cert, if any, concatenated after server cert).")
@@ -60,71 +65,83 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	reviewResponse := v1beta1.AdmissionResponse{}
 	reviewResponse.Allowed = true
 
+	raw := ar.Request.Object.Raw
+	secret := corev1.Secret{}
+	if err := json.Unmarshal(raw, &secret); err != nil {
+		glog.Error(err)
+		return toAdmissionResponse(err)
+	}
+
 	// TODO the following is sample code, irrelevant to what we really want to do
 	// Implement the real thing with secrets
 
 	/*
-		raw := ar.Request.Object.Raw
-		pod := corev1.Pod{}
-		deserializer := codecs.UniversalDeserializer()
-		if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
-			glog.Error(err)
-			return toAdmissionResponse(err)
-		}
+	   raw := ar.Request.Object.Raw
+	   pod := corev1.Pod{}
+	   deserializer := codecs.UniversalDeserializer()
+	   if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
+	       glog.Error(err)
+	       return toAdmissionResponse(err)
+	   }
 
 
-		var msg string
-		if v, ok := pod.Labels["webhook-e2e-test"]; ok {
-			if v == "webhook-disallow" {
-				reviewResponse.Allowed = false
-				msg = msg + "the pod contains unwanted label; "
-			}
-			if v == "wait-forever" {
-				reviewResponse.Allowed = false
-				msg = msg + "the pod response should not be sent; "
-				<-make(chan int) // Sleep forever - no one sends to this channel
-			}
-		}
-		for _, container := range pod.Spec.Containers {
-			if strings.Contains(container.Name, "webhook-disallow") {
-				reviewResponse.Allowed = false
-				msg = msg + "the pod contains unwanted container name; "
-			}
-		}
-		if !reviewResponse.Allowed {
-			reviewResponse.Result = &metav1.Status{Message: strings.TrimSpace(msg)}
-		}
+	   var msg string
+	   if v, ok := pod.Labels["webhook-e2e-test"]; ok {
+	       if v == "webhook-disallow" {
+	           reviewResponse.Allowed = false
+	           msg = msg + "the pod contains unwanted label; "
+	       }
+	       if v == "wait-forever" {
+	           reviewResponse.Allowed = false
+	           msg = msg + "the pod response should not be sent; "
+	           <-make(chan int) // Sleep forever - no one sends to this channel
+	       }
+	   }
+	   for _, container := range pod.Spec.Containers {
+	       if strings.Contains(container.Name, "webhook-disallow") {
+	           reviewResponse.Allowed = false
+	           msg = msg + "the pod contains unwanted container name; "
+	       }
+	   }
+	   if !reviewResponse.Allowed {
+	       reviewResponse.Result = &metav1.Status{Message: strings.TrimSpace(msg)}
+	   }
 	*/
 	return &reviewResponse
 }
 
 func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
+	reviewResponse := v1beta1.AdmissionResponse{}
+	reviewResponse.Allowed = true
 
 	// TODO: implement
-	/*
-		glog.V(2).Info("mutating pods")
-		podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
-		if ar.Request.Resource != podResource {
-			glog.Errorf("expect resource to be %s", podResource)
-			return nil
-		}
 
-		raw := ar.Request.Object.Raw
-		pod := corev1.Pod{}
-		deserializer := codecs.UniversalDeserializer()
-		if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
-			glog.Error(err)
-			return toAdmissionResponse(err)
-		}
-		reviewResponse := v1beta1.AdmissionResponse{}
-		reviewResponse.Allowed = true
-		if pod.Name == "webhook-to-be-mutated" {
-			reviewResponse.Patch = []byte(addInitContainerPatch)
-			pt := v1beta1.PatchTypeJSONPatch
-			reviewResponse.PatchType = &pt
-		}
-		return &reviewResponse
+	/*
+	   glog.V(2).Info("mutating pods")
+	   podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	   if ar.Request.Resource != podResource {
+	       glog.Errorf("expect resource to be %s", podResource)
+	       return nil
+	   }
+
+	   raw := ar.Request.Object.Raw
+	   pod := corev1.Pod{}
+	   deserializer := codecs.UniversalDeserializer()
+	   if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
+	       glog.Error(err)
+	       return toAdmissionResponse(err)
+	   }
+	   reviewResponse := v1beta1.AdmissionResponse{}
+	   reviewResponse.Allowed = true
+	   if pod.Name == "webhook-to-be-mutated" {
+	       reviewResponse.Patch = []byte(addInitContainerPatch)
+	       pt := v1beta1.PatchTypeJSONPatch
+	       reviewResponse.PatchType = &pt
+	   }
+	   return &reviewResponse
 	*/
+
+	return &reviewResponse
 }
 
 type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
@@ -147,10 +164,13 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	glog.V(2).Info(fmt.Sprintf("handling request: %v", body))
 	var reviewResponse *v1beta1.AdmissionResponse
 	ar := v1beta1.AdmissionReview{}
-	deserializer := codecs.UniversalDeserializer()
-	if _, _, err := deserializer.Decode(body, nil, &ar); err != nil {
+	if err := json.Unmarshal(body, &ar); err != nil {
 		glog.Error(err)
-		reviewResponse = toAdmissionResponse(err)
+		reviewResponse = &v1beta1.AdmissionResponse{
+			Result: &metav1.Status{
+				Message: err.Error(),
+			},
+		}
 	} else {
 		reviewResponse = admit(ar)
 	}
@@ -190,6 +210,8 @@ func main() {
 	var config Config
 	config.addFlags()
 	flag.Parse()
+
+	IKeys = make(map[metav1.LabelSelector]string)
 
 	http.HandleFunc("/secrets", serveSecrets)
 	http.HandleFunc("/mutating-pods", serveMutatePods)
