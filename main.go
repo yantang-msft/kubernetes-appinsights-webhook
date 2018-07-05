@@ -35,8 +35,13 @@ type Config struct {
 	KeyFile  string
 }
 
+type appInsightsSecret struct {
+	Selector metav1.LabelSelector
+	Name     string
+}
+
 var (
-	IKeys map[metav1.LabelSelector]string
+	aiSecrets []appInsightsSecret
 )
 
 func (c *Config) addFlags() {
@@ -211,7 +216,7 @@ func main() {
 	config.addFlags()
 	flag.Parse()
 
-	IKeys = make(map[metav1.LabelSelector]string)
+	aiSecrets = make([]appInsightsSecret, 1)
 
 	http.HandleFunc("/secrets", serveSecrets)
 	http.HandleFunc("/mutating-pods", serveMutatePods)
