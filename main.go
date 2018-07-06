@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sync"
 
 	"github.com/golang/glog"
 	"k8s.io/api/admission/v1beta1"
@@ -27,6 +28,9 @@ const (
 	addInitContainerPatch string = `[
          {"op":"add","path":"/spec/initContainers","value":[{"image":"webhook-added-image","name":"webhook-added-init-container","resources":{}}]}
     ]`
+
+	// IKeyVarName is the well-known name for Application Insights insrumentation key environment variable
+	IKeyVarName string = "APPINSIGHTS_INSTRUMENTATIONKEY"
 )
 
 // Config contains the server (the webhook) cert and key.
@@ -35,13 +39,21 @@ type Config struct {
 	KeyFile  string
 }
 
+// Data about a secret that contains Application Insights instrumentation key and other AppInsights configuration data.
 type appInsightsSecret struct {
-	Selector metav1.LabelSelector
-	Name     string
+	Selector  metav1.LabelSelector
+	Name      string
+	Namespace string
 }
 
+type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
+
 var (
-	aiSecrets []appInsightsSecret
+	aiSecrets     []appInsightsSecret
+	aiSecretsLock sync.RWMutex
+
+	// AllowUnchanged is a standard response instructing Kubernetes to allow the object in its original form
+	AllowUnchanged v1beta1.AdmissionResponse
 )
 
 func (c *Config) addFlags() {
@@ -58,17 +70,13 @@ func toAdmissionResponse(err error) *v1beta1.AdmissionResponse {
 }
 
 func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
-	glog.V(2).Info("admitting secrets")
-
 	secretResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
-	if ar.Request.Resource != secretResource {
-		err := fmt.Errorf("expect resource to be %s", secretResource)
+	if currentResource := ar.Request.Resource; currentResource != secretResource {
+		err := fmt.Errorf("Expected resource to be a secret but it is a '%s' (group '%s', version %s)",
+			currentResource.Resource, currentResource.Group, currentResource.Version)
 		glog.Error(err)
 		return toAdmissionResponse(err)
 	}
-
-	reviewResponse := v1beta1.AdmissionResponse{}
-	reviewResponse.Allowed = true
 
 	raw := ar.Request.Object.Raw
 	secret := corev1.Secret{}
@@ -77,49 +85,74 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		return toAdmissionResponse(err)
 	}
 
-	// TODO the following is sample code, irrelevant to what we really want to do
-	// Implement the real thing with secrets
+	if ar.Request.Operation == v1beta1.Create {
+		glog.V(2).Infof("Admitting new secret %s.%s ...", secret.Namespace, secret.Name)
+		handleSecretCreation(secret)
+	}
 
-	/*
-	   raw := ar.Request.Object.Raw
-	   pod := corev1.Pod{}
-	   deserializer := codecs.UniversalDeserializer()
-	   if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
-	       glog.Error(err)
-	       return toAdmissionResponse(err)
-	   }
+	// TODO handle secret update and deletion
 
+	return &AllowUnchanged
+}
 
-	   var msg string
-	   if v, ok := pod.Labels["webhook-e2e-test"]; ok {
-	       if v == "webhook-disallow" {
-	           reviewResponse.Allowed = false
-	           msg = msg + "the pod contains unwanted label; "
-	       }
-	       if v == "wait-forever" {
-	           reviewResponse.Allowed = false
-	           msg = msg + "the pod response should not be sent; "
-	           <-make(chan int) // Sleep forever - no one sends to this channel
-	       }
-	   }
-	   for _, container := range pod.Spec.Containers {
-	       if strings.Contains(container.Name, "webhook-disallow") {
-	           reviewResponse.Allowed = false
-	           msg = msg + "the pod contains unwanted container name; "
-	       }
-	   }
-	   if !reviewResponse.Allowed {
-	       reviewResponse.Result = &metav1.Status{Message: strings.TrimSpace(msg)}
-	   }
-	*/
-	return &reviewResponse
+func handleSecretRemoval(secret corev1.Secret) {
+
+}
+
+func handleSecretCreation(secret corev1.Secret) {
+	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
+		glog.V(2).Infof("Secret %s does not have %s in its data", secret.Name, IKeyVarName)
+		return
+	}
+
+	if len(secret.Labels) == 0 {
+		glog.Warningf("Cannot identify pods to use with secret %s.%s because the secret does not have any labels",
+			secret.Namespace, secret.Name)
+		return
+	}
+
+	glog.V(2).Infof("Adding %s to list of secrets with AppInsights key information", secret.Name)
+	ais := appInsightsSecret{}
+	ais.Name = secret.Name
+	ais.Namespace = secret.Namespace
+	// Here we will just gather all the labels on the secret and use them as a label selector to identify the pods
+	// that should be injected with instrumentation key information
+	//
+	// CONSIDER having a well-known annotation that contains a label selector that identifies the pods explicitly.
+	// This annotation could be optional, and the "use secret labels as a label selector" could be used by default
+	ais.Selector = metav1.LabelSelector{}
+	for lName, lValue := range secret.Labels {
+		glog.V(2).Infof("Pods that use secret %s must have label %s with value %s", secret.Name, lName, lValue)
+		ais.Selector.MatchLabels[lName] = lValue
+	}
+
+	aiSecretsLock.Lock()
+	defer aiSecretsLock.Unlock()
+	aiSecrets = append(aiSecrets, ais)
 }
 
 func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	reviewResponse := v1beta1.AdmissionResponse{}
 	reviewResponse.Allowed = true
 
-	// TODO: implement
+	podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	if currentResource := ar.Request.Resource; currentResource != podResource {
+		err := fmt.Errorf("Expected resource to be a oid but it is a '%s' (group '%s', version %s)",
+			currentResource.Resource, currentResource.Group, currentResource.Version)
+		glog.Error(err)
+		return toAdmissionResponse(err)
+	}
+
+	raw := ar.Request.Object.Raw
+	pod := corev1.Pod{}
+	if err := json.Unmarshal(raw, &pod); err != nil {
+		glog.Error(err)
+		return toAdmissionResponse(err)
+	}
+	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
+
+	// ONLY modify if the operation is a creation or update
+	// Iterate aiSecrets slice backwards so that latest secrets are preferred
 
 	/*
 	   glog.V(2).Info("mutating pods")
@@ -149,8 +182,6 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	return &reviewResponse
 }
 
-type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
-
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	var body []byte
 	if r.Body != nil {
@@ -166,7 +197,7 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		return
 	}
 
-	glog.V(2).Info(fmt.Sprintf("handling request: %v", body))
+	glog.V(2).Info(fmt.Sprintf("Handling request: %v", body))
 	var reviewResponse *v1beta1.AdmissionResponse
 	ar := v1beta1.AdmissionReview{}
 	if err := json.Unmarshal(body, &ar); err != nil {
@@ -179,7 +210,7 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	} else {
 		reviewResponse = admit(ar)
 	}
-	glog.V(2).Info(fmt.Sprintf("sending response: %v", reviewResponse))
+	glog.V(2).Info(fmt.Sprintf("Sending response: %v", reviewResponse))
 
 	response := v1beta1.AdmissionReview{}
 	if reviewResponse != nil {
@@ -215,6 +246,8 @@ func main() {
 	var config Config
 	config.addFlags()
 	flag.Parse()
+
+	AllowUnchanged = v1beta1.AdmissionResponse{Allowed: true}
 
 	aiSecrets = make([]appInsightsSecret, 1)
 
