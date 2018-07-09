@@ -20,9 +20,19 @@ import (
 )
 
 const (
-	addIKeyVarPatch string = `[
-         {"op":"add","path":"/spec/initContainers","value":[{"image":"webhook-added-image","name":"webhook-added-init-container","resources":{}}]}
-    ]`
+	addIKeyVarPatch string = `{
+        "op": "add",
+        "path": "/spec/containers/%d/env/-",
+        "value": {
+            "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+            "valueFrom" : {
+                "secretKeyRef: {
+                    "name": "%s",
+                    "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
+                }
+            }
+        }
+    }`
 
 	// IKeyVarName is the well-known name for Application Insights insrumentation key environment variable
 	IKeyVarName string = "APPINSIGHTS_INSTRUMENTATIONKEY"
@@ -138,6 +148,8 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		return toAdmissionResponse(err)
 	}
 
+	// Note: for the "update" operation ar.Request.Object is the "new" object vs. ar.Request.OldObject.
+	// So whether it is a "create" operation, or "update" operation, ar.Request.Object is the right one to examine.
 	raw := ar.Request.Object.Raw
 	pod := corev1.Pod{}
 	if err := json.Unmarshal(raw, &pod); err != nil {
@@ -151,63 +163,70 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		return &AllowUnchanged
 	}
 
-	response := v1beta1.AdmissionResponse{}
-	response.Allowed = true
-
 	aiSecretsLock.RLock()
 	defer aiSecretsLock.RUnlock()
 
 	// Iterate aiSecrets slice backwards so that latest secrets are preferred
 	for i := len(aiSecrets) - 1; i >= 0; i-- {
-		selector, err := metav1.LabelSelectorAsSelector(&aiSecrets[i].Selector)
+		secret := aiSecrets[i]
+		selector, err := metav1.LabelSelectorAsSelector(&secret.Selector)
 		if err != nil {
-			glog.Warningf("One of the stored LabelSelectors could not be converted to a Selector: %s", err)
+			glog.Warningf(
+				"Unexpected error when trying to use secret %s.%s. One of the stored LabelSelectors could not be converted to a Selector. %s",
+				secret.Namespace, secret.Name, err)
 			continue
 		}
 
-		if selector.Matches(labels.Set(pod.Labels)) {
-			// We have found a secret that has a matching set of labels with the pod.
-
-			for cIndex, container := range pod.Spec.Containers {
-
-				// Make sure we do not patch if the AppInsights instrumentation key is already set on the pod
-				iKeyVarExists := false
-				for _, envVar := range container.Env {
-					if envVar.Name == IKeyVarName {
-						iKeyVarExists = true
-						break
-					}
-				}
-				if iKeyVarExists {
-					continue
-				}
-
-				// TODO: add patch to list of patches
-			}
-
-			response.Patch = "" // TODO: construct patch array properly
-			response.PatchType
-
-			// We found a matching secret and we patched all containers as necessary.
-			// There is nothing more left to do for this pod.
-			break
+		if secret.Namespace == pod.Namespace && selector.Matches(labels.Set(pod.Labels)) {
+			glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s", secret.Name, pod.Name)
+			return createPatchResponse(pod, i)
 		}
 	}
 
+	glog.V(2).Infof("No matching secrets found for pod %s.%s, allowing unchanged", pod.Namespace, pod.Name)
+	return &AllowUnchanged
+}
+
+func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResponse {
+	response := v1beta1.AdmissionResponse{}
+	response.Allowed = true
+	patchList := ""
+
+	for cIndex, container := range pod.Spec.Containers {
+
+		// Make sure we do not patch if the AppInsights instrumentation key is already set on the pod
+		iKeyVarExists := false
+		for _, envVar := range container.Env {
+			if envVar.Name == IKeyVarName {
+				glog.V(2).Infof(
+					"Container %s of pod %s already has an instrumentation key variable, skipping",
+					container.Name, pod.Name)
+
+				iKeyVarExists = true
+				break
+			}
+		}
+		if iKeyVarExists {
+			continue
+		}
+
+		if len(patchList) > 0 {
+			patchList += ",\n"
+		}
+		patchList += fmt.Sprintf(addIKeyVarPatch, cIndex, aiSecrets[secretIndex].Name)
+	}
+
+	if len(patchList) > 0 {
+		patchStr := "[\n" + patchList + "\n]"
+		glog.V(2).Infof("Patching request for pod %s is: %s", pod.Name, patchStr)
+		response.Patch = []byte(patchStr)
+		pt := v1beta1.PatchTypeJSONPatch
+		response.PatchType = &pt
+	} else {
+		glog.V(2).Infof("None of the containers inside pod %s required patching to add instrumentation key variable", pod.Name)
+	}
+
 	return &response
-
-	/*
-	   reviewResponse := v1beta1.AdmissionResponse{}
-	   reviewResponse.Allowed = true
-	   if pod.Name == "webhook-to-be-mutated" {
-	       reviewResponse.Patch = []byte(addInitContainerPatch)
-	       pt := v1beta1.PatchTypeJSONPatch
-	       reviewResponse.PatchType = &pt
-	   }
-	   return &reviewResponse
-	*/
-
-	return &reviewResponse
 }
 
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
