@@ -15,17 +15,12 @@ import (
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
-	patch1 string = `[
-         { "op": "add", "path": "/data/mutation-stage-1", "value": "yes" }
-     ]`
-	patch2 string = `[
-         { "op": "add", "path": "/data/mutation-stage-2", "value": "yes" }
-     ]`
-	addInitContainerPatch string = `[
+	addIKeyVarPatch string = `[
          {"op":"add","path":"/spec/initContainers","value":[{"image":"webhook-added-image","name":"webhook-added-init-container","resources":{}}]}
     ]`
 
@@ -123,7 +118,7 @@ func handleSecretCreation(secret corev1.Secret) {
 	ais.Selector = metav1.LabelSelector{}
 	for lName, lValue := range secret.Labels {
 		glog.V(2).Infof("Pods that use secret %s must have label %s with value %s", secret.Name, lName, lValue)
-		ais.Selector.MatchLabels[lName] = lValue
+		metav1.AddLabelToSelector(&ais.Selector, lName, lValue)
 	}
 
 	aiSecretsLock.Lock()
@@ -151,24 +146,57 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	}
 	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
 
-	// ONLY modify if the operation is a creation or update
+	if ar.Request.Operation != v1beta1.Create && ar.Request.Operation != v1beta1.Update {
+		glog.V(2).Infof("Operation on the pod %s is %s, allowing unchanged", pod.Name, ar.Request.Operation)
+		return &AllowUnchanged
+	}
+
+	response := v1beta1.AdmissionResponse{}
+	response.Allowed = true
+
+	aiSecretsLock.RLock()
+	defer aiSecretsLock.RUnlock()
+
 	// Iterate aiSecrets slice backwards so that latest secrets are preferred
+	for i := len(aiSecrets) - 1; i >= 0; i-- {
+		selector, err := metav1.LabelSelectorAsSelector(&aiSecrets[i].Selector)
+		if err != nil {
+			glog.Warningf("One of the stored LabelSelectors could not be converted to a Selector: %s", err)
+			continue
+		}
+
+		if selector.Matches(labels.Set(pod.Labels)) {
+			// We have found a secret that has a matching set of labels with the pod.
+
+			for cIndex, container := range pod.Spec.Containers {
+
+				// Make sure we do not patch if the AppInsights instrumentation key is already set on the pod
+				iKeyVarExists := false
+				for _, envVar := range container.Env {
+					if envVar.Name == IKeyVarName {
+						iKeyVarExists = true
+						break
+					}
+				}
+				if iKeyVarExists {
+					continue
+				}
+
+				// TODO: add patch to list of patches
+			}
+
+			response.Patch = "" // TODO: construct patch array properly
+			response.PatchType
+
+			// We found a matching secret and we patched all containers as necessary.
+			// There is nothing more left to do for this pod.
+			break
+		}
+	}
+
+	return &response
 
 	/*
-	   glog.V(2).Info("mutating pods")
-	   podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
-	   if ar.Request.Resource != podResource {
-	       glog.Errorf("expect resource to be %s", podResource)
-	       return nil
-	   }
-
-	   raw := ar.Request.Object.Raw
-	   pod := corev1.Pod{}
-	   deserializer := codecs.UniversalDeserializer()
-	   if _, _, err := deserializer.Decode(raw, nil, &pod); err != nil {
-	       glog.Error(err)
-	       return toAdmissionResponse(err)
-	   }
 	   reviewResponse := v1beta1.AdmissionResponse{}
 	   reviewResponse.Allowed = true
 	   if pod.Name == "webhook-to-be-mutated" {
