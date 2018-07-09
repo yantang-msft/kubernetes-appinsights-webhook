@@ -54,6 +54,9 @@ type appInsightsSecret struct {
 type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
 
 var (
+	// CONSIDER It may be more robust to _also_ periodically load information about all secrets in the system and compare this
+	// information with what we have cached in the aiSecrets slice
+
 	aiSecrets     []appInsightsSecret
 	aiSecretsLock sync.RWMutex
 
@@ -90,18 +93,52 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		return toAdmissionResponse(err)
 	}
 
-	if ar.Request.Operation == v1beta1.Create {
-		glog.V(2).Infof("Admitting new secret %s.%s ...", secret.Namespace, secret.Name)
+	operation := ar.Request.Operation
+	if operation == v1beta1.Create {
+		glog.V(2).Infof("Admitting new secret %s.%s", secret.Namespace, secret.Name)
+		handleSecretCreation(secret)
+	} else if operation == v1beta1.Delete {
+		glog.V(2).Infof("Secret %s.%s is being deleted", secret.Namespace, secret.Name)
+		handleSecretRemoval(secret)
+	} else if operation == v1beta1.Update {
+		glog.V(2).Infof("Secret %s.%s is being updated", secret.Namespace, secret.Name)
+
+		oldSecret := corev1.Secret{}
+		if err := json.Unmarshal(ar.Request.OldObject.Raw, &oldSecret); err != nil {
+			glog.Error(err)
+			return toAdmissionResponse(err)
+		}
+
+		handleSecretRemoval(oldSecret)
 		handleSecretCreation(secret)
 	}
-
-	// TODO handle secret update and deletion
 
 	return &AllowUnchanged
 }
 
 func handleSecretRemoval(secret corev1.Secret) {
+	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
+		// Secret does not contain AppInsights instrumentation key--not relevant to us.
+		return
+	}
 
+	// Taking a lock now ensures stable iteration over aiSecrets
+	aiSecretsLock.Lock()
+	defer aiSecretsLock.Unlock()
+
+	newSecrets := make([]appInsightsSecret, len(aiSecrets))
+	i := 0
+	for _, aiSecret := range aiSecrets {
+		if aiSecret.Name == secret.Name && aiSecret.Namespace == secret.Namespace {
+			glog.V(2).Infof("Removing cached data for secret %s.%s", secret.Namespace, secret.Name)
+			continue
+		}
+
+		newSecrets[i] = aiSecret
+		i++
+	}
+
+	aiSecrets = newSecrets
 }
 
 func handleSecretCreation(secret corev1.Secret) {
