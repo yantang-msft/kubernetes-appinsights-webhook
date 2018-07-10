@@ -1,0 +1,7 @@
+# Default values for ai-webhook.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -v=2 enables verbose logging for testing
+appinsights_webhook_cmd: ["-logtostderr=true", "-v=2"]
+appinsights_webhook_image: appinsights-webhook:v0.1

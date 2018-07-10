@@ -1,0 +1,4 @@
+To view the logs from the web hook do
+  kubectl logs -f <pod name>
+where <pod name> is the name of the web hook pod to watch.
+
