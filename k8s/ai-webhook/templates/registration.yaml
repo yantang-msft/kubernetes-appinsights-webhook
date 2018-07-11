@@ -1,0 +1,64 @@
+{{- $ca := genCA "appinsights-webhook-ca" 365 }}
+{{- $cn := printf "%s-%s" .Release.Name .Chart.Name }}
+{{- $altName1 := printf "%s-%s.%s" .Release.Name .Chart.Name .Release.Namespace }}
+{{- $altName2 := printf "%s-%s.%s.svc" .Release.Name .Chart.Name .Release.Namespace }}
+{{- $cert := genSignedCert $cn nil (list $altName1 $altName2) 365 $ca }}
+
+---
+apiVersion: admissionregistration.k8s.io/v1beta1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+    release: {{ .Release.Name }}
+webhooks:
+- clientConfig:
+    caBundle: {{ b64enc $ca.Cert }}
+    service:
+      name: {{ .Chart.Name }}
+      namespace: {{ .Release.Namespace }}
+      path: /mutating-pods
+  name: {{ .Chart.Name }}.azure.microsoft.com
+  rules:
+  - apiGroups:
+    - "*"
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pods
+- clientConfig:
+    caBundle: {{ b64enc $ca.Cert }}
+    service:
+      name: {{ .Chart.Name }}
+      namespace: {{ .Release.Namespace }}
+      path: /secrets
+  name: {{ .Chart.Name }}.azure.microsoft.com
+  rules:
+  - apiGroups:
+    - "*"
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    - DELETE
+    resources:
+    - secrets
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Chart.Name }}-cert
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+    release: {{ .Release.Name }}
+type: Opaque
+data:
+  tls.crt: {{ b64enc $cert.Cert }}
+  tls.key: {{ b64enc $cert.Key }}

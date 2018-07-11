@@ -1,0 +1,60 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+    release: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.webhook.replica_count }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+        release: {{ .Release.Name }}
+        role: webhook-svc-impl
+    spec:
+      serviceAccountName: "{{ .Values.controller.serviceAccount }}"
+      containers:
+      - name: webhook
+        image: {{ .Values.webhook.image }}
+        imagePullPolicy: IfNotPresent
+        args: {{ .Values.webhook.cmdargs }}
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /health
+            port: {{ .Values.webhook.container_port }}
+        ports:
+        - containerPort: {{ .Values.webhook.container_port }}
+        volumeMounts:
+        - name: certs
+          mountPath: /home/aiwebhook/certs
+          readOnly: true
+      volumes:
+      - name: certs
+        secret:
+          secretName: {{ .Chart.Name }}-cert
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Chart.Name }}
+    release: {{ .Release.Name }}
+spec:
+  selector:
+    app: {{ .Chart.Name }}
+    release: {{ .Release.Name }}
+    role: webhook-svc-impl
+  ports:
+    - port: {{ .Values.webhook.service_port }}
+      targetPort: {{ .Values.webhook.container_port }}

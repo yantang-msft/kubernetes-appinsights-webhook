@@ -25,8 +25,8 @@ func getClient() *kubernetes.Clientset {
 	return clientset
 }
 
-func configTLS(config Config, clientset *kubernetes.Clientset) *tls.Config {
-	sCert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+func configTLS(certFile string, keyFile string, clientset *kubernetes.Clientset) *tls.Config {
+	sCert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		glog.Fatal(err)
 	}
