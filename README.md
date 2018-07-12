@@ -11,5 +11,17 @@ into the pod, using environment variables. It works in a way similar to PodPrese
 
 # Build 
 
+    make
+
 # Setup
 
+    cd k8s
+    helm install ai-webhook --name ai-webhook-rel --namespace appinsights-webhook
+
+The namespace name is arbitrary; change it as necessary, but it must exist before the webhook is deployed. If the namespace does not exist, create it:
+
+    kubectl create namespace appinsights-webhook
+
+Do remove the deployment
+
+    helm del --purge ai-webhook-rel

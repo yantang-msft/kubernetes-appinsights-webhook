@@ -17,13 +17,13 @@ webhooks:
 - clientConfig:
     caBundle: {{ b64enc $ca.Cert }}
     service:
-      name: {{ .Chart.Name }}
+      name: {{ .Chart.Name }}-svc
       namespace: {{ .Release.Namespace }}
       path: /mutating-pods
-  name: {{ .Chart.Name }}.azure.microsoft.com
+  name: pods.{{ .Chart.Name }}.azure.microsoft.com
   rules:
   - apiGroups:
-    - "*"
+    - ""
     apiVersions:
     - v1
     operations:
@@ -34,13 +34,13 @@ webhooks:
 - clientConfig:
     caBundle: {{ b64enc $ca.Cert }}
     service:
-      name: {{ .Chart.Name }}
+      name: {{ .Chart.Name }}-svc
       namespace: {{ .Release.Namespace }}
       path: /secrets
-  name: {{ .Chart.Name }}.azure.microsoft.com
+  name: secrets.{{ .Chart.Name }}.azure.microsoft.com
   rules:
   - apiGroups:
-    - "*"
+    - ""
     apiVersions:
     - v1
     operations:

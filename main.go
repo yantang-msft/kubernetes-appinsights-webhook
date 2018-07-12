@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -317,6 +318,8 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	flag.Parse() // Required to parse glog flags
+
 	// CONSIDER Make the cert file location configurable
 	exec, err := os.Executable()
 	if err != nil {
@@ -341,6 +344,7 @@ func main() {
 		TLSConfig: configTLS(certFile, keyFile, clientset),
 	}
 
+	glog.V(2).Info("Certificates loaded. Listening for requests...")
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		glog.Fatal(err)
 	}

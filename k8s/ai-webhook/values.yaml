@@ -3,9 +3,9 @@
 # Declare variables to be passed into your templates.
 
 webhook:
-  # -v=2 enables verbose logging for testing
-  cmdargs: ["--logtostderr", "-v=2"]
-  image: appinsights-webhook:v0.1
+  # -v 2 enables verbose logging for testing
+  cmdargs: '["--logtostderr", "-v=2"]'
+  image: appinsights-webhook:0.1
   container_port: 443
   service_port: 6221
   replica_count: 1

@@ -19,7 +19,6 @@ spec:
         release: {{ .Release.Name }}
         role: webhook-svc-impl
     spec:
-      serviceAccountName: "{{ .Values.controller.serviceAccount }}"
       containers:
       - name: webhook
         image: {{ .Values.webhook.image }}
@@ -51,6 +50,7 @@ metadata:
     app: {{ .Chart.Name }}
     release: {{ .Release.Name }}
 spec:
+  type: LoadBalancer
   selector:
     app: {{ .Chart.Name }}
     release: {{ .Release.Name }}
@@ -58,3 +58,4 @@ spec:
   ports:
     - port: {{ .Values.webhook.service_port }}
       targetPort: {{ .Values.webhook.container_port }}
+      name: {{ .Chart.Name }}-svc
