@@ -1,7 +1,7 @@
 {{- $ca := genCA "appinsights-webhook-ca" 365 }}
-{{- $cn := printf "%s-%s" .Release.Name .Chart.Name }}
-{{- $altName1 := printf "%s-%s.%s" .Release.Name .Chart.Name .Release.Namespace }}
-{{- $altName2 := printf "%s-%s.%s.svc" .Release.Name .Chart.Name .Release.Namespace }}
+{{- $cn := .Values.webhook.service_name }}
+{{- $altName1 := printf "%s.%s" .Values.webhook.service_name .Release.Namespace }}
+{{- $altName2 := printf "%s.%s.svc" .Values.webhook.service_name .Release.Namespace }}
 {{- $cert := genSignedCert $cn nil (list $altName1 $altName2) 365 $ca }}
 
 ---

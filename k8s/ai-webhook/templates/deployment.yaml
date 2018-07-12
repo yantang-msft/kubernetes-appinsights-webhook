@@ -28,9 +28,9 @@ spec:
           httpGet:
             scheme: HTTPS
             path: /health
-            port: {{ .Values.webhook.container_port }}
+            port: {{ .Values.webhook.service_port }}
         ports:
-        - containerPort: {{ .Values.webhook.container_port }}
+        - containerPort: {{ .Values.webhook.service_port }}
         volumeMounts:
         - name: certs
           mountPath: /home/aiwebhook/certs
@@ -44,18 +44,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Chart.Name }}-svc
+  name: {{ .Values.webhook.service_name }}
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Chart.Name }}
     release: {{ .Release.Name }}
 spec:
-  type: LoadBalancer
   selector:
     app: {{ .Chart.Name }}
     release: {{ .Release.Name }}
     role: webhook-svc-impl
   ports:
     - port: {{ .Values.webhook.service_port }}
-      targetPort: {{ .Values.webhook.container_port }}
+      targetPort: {{ .Values.webhook.service_port }}
       name: {{ .Chart.Name }}-svc

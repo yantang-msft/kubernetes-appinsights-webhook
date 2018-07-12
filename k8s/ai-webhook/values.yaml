@@ -6,6 +6,6 @@ webhook:
   # -v 2 enables verbose logging for testing
   cmdargs: '["--logtostderr", "-v=2"]'
   image: appinsights-webhook:0.1
-  container_port: 443
-  service_port: 6221
+  service_port: 443
   replica_count: 1
+  service_name: appinsights-webhook-svc
