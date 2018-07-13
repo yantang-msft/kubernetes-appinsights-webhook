@@ -53,7 +53,7 @@ type appInsightsSecret struct {
 	Namespace string
 }
 
-type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
+type admitFunc func(v1beta1.AdmissionReview) (response *v1beta1.AdmissionResponse, trackDetails bool)
 
 var (
 	// TODO: periodically load information about all secrets in the system
@@ -78,52 +78,53 @@ func toErrorResponse(err error) *v1beta1.AdmissionResponse {
 	}
 }
 
-func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
+func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, trackDetails bool) {
 	secretResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 	if currentResource := ar.Request.Resource; currentResource != secretResource {
 		glog.Warningf("Expected resource to be a secret but it is a '%s' (group '%s', version %s)",
 			currentResource.Resource, currentResource.Group, currentResource.Version)
-		return &AllowUnchanged
+		return &AllowUnchanged, true
 	}
 
 	raw := ar.Request.Object.Raw
 	secret := corev1.Secret{}
 	if _, _, err := decoder.Decode(raw, nil, &secret); err != nil {
 		glog.Error(err)
-		return &AllowUnchanged
+		return &AllowUnchanged, true
 	}
 
 	if secret.Namespace == KubeSystemNamespace {
-		return &AllowUnchanged
+		return &AllowUnchanged, false
 	}
 
 	operation := ar.Request.Operation
 	if operation == v1beta1.Create {
 		glog.V(2).Infof("Admitting new secret %s.%s", secret.Namespace, secret.Name)
-		handleSecretCreation(secret)
+		trackDetails = handleSecretCreation(secret)
 	} else if operation == v1beta1.Delete {
 		glog.V(2).Infof("Secret %s.%s is being deleted", secret.Namespace, secret.Name)
-		handleSecretRemoval(secret)
+		trackDetails = handleSecretRemoval(secret)
 	} else if operation == v1beta1.Update {
 		glog.V(2).Infof("Secret %s.%s is being updated", secret.Namespace, secret.Name)
 
 		oldSecret := corev1.Secret{}
 		if _, _, err := decoder.Decode(ar.Request.OldObject.Raw, nil, &oldSecret); err != nil {
 			glog.Error(err)
-			return &AllowUnchanged
+			return &AllowUnchanged, true
 		}
 
-		handleSecretRemoval(oldSecret)
-		handleSecretCreation(secret)
+		interestingRemoval := handleSecretRemoval(oldSecret)
+		interestingCreation := handleSecretCreation(secret)
+		trackDetails = interestingRemoval || interestingCreation
 	}
 
-	return &AllowUnchanged
+	return &AllowUnchanged, trackDetails
 }
 
-func handleSecretRemoval(secret corev1.Secret) {
+func handleSecretRemoval(secret corev1.Secret) (trackDetails bool) {
 	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
 		// Secret does not contain AppInsights instrumentation key--not relevant to us.
-		return
+		return false
 	}
 
 	// Taking a lock now ensures stable iteration over aiSecrets
@@ -135,6 +136,7 @@ func handleSecretRemoval(secret corev1.Secret) {
 	for _, aiSecret := range aiSecrets {
 		if aiSecret.Name == secret.Name && aiSecret.Namespace == secret.Namespace {
 			glog.V(2).Infof("Removing cached data for secret %s.%s", secret.Namespace, secret.Name)
+			trackDetails = true
 			continue
 		}
 
@@ -143,18 +145,19 @@ func handleSecretRemoval(secret corev1.Secret) {
 	}
 
 	aiSecrets = newSecrets
+	return trackDetails
 }
 
-func handleSecretCreation(secret corev1.Secret) {
+func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
 	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
 		glog.V(2).Infof("Secret %s does not have %s in its data", secret.Name, IKeyVarName)
-		return
+		return false
 	}
 
 	if len(secret.Labels) == 0 {
 		glog.Warningf("Cannot identify pods to use with secret %s.%s because the secret does not have any labels",
 			secret.Namespace, secret.Name)
-		return
+		return false
 	}
 
 	glog.V(2).Infof("Adding %s to list of secrets with AppInsights key information", secret.Name)
@@ -175,9 +178,10 @@ func handleSecretCreation(secret corev1.Secret) {
 	aiSecretsLock.Lock()
 	defer aiSecretsLock.Unlock()
 	aiSecrets = append(aiSecrets, ais)
+	return true
 }
 
-func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
+func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, trackDetails bool) {
 	reviewResponse := v1beta1.AdmissionResponse{}
 	reviewResponse.Allowed = true
 
@@ -185,7 +189,7 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	if currentResource := ar.Request.Resource; currentResource != podResource {
 		glog.Warningf("Expected resource to be a pod but it is a '%s' (group '%s', version %s)",
 			currentResource.Resource, currentResource.Group, currentResource.Version)
-		return &AllowUnchanged
+		return &AllowUnchanged, true
 	}
 
 	// Note: for the "update" operation ar.Request.Object is the "new" object vs. ar.Request.OldObject.
@@ -194,18 +198,18 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	pod := corev1.Pod{}
 	if _, _, err := decoder.Decode(raw, nil, &pod); err != nil {
 		glog.Error(err)
-		return &AllowUnchanged
+		return &AllowUnchanged, true
 	}
 
 	if pod.Namespace == KubeSystemNamespace {
-		return &AllowUnchanged
+		return &AllowUnchanged, false
 	}
 
 	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
 
 	if ar.Request.Operation != v1beta1.Create && ar.Request.Operation != v1beta1.Update {
 		glog.V(2).Infof("Operation on the pod %s is %s, allowing unchanged", pod.Name, ar.Request.Operation)
-		return &AllowUnchanged
+		return &AllowUnchanged, false
 	}
 
 	aiSecretsLock.RLock()
@@ -224,12 +228,12 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 
 		if secret.Namespace == pod.Namespace && selector.Matches(labels.Set(pod.Labels)) {
 			glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s", secret.Name, pod.Name)
-			return createPatchResponse(pod, i)
+			return createPatchResponse(pod, i), true
 		}
 	}
 
 	glog.V(2).Infof("No matching secrets found for pod %s.%s, allowing unchanged", pod.Namespace, pod.Name)
-	return &AllowUnchanged
+	return &AllowUnchanged, false
 }
 
 func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResponse {
@@ -274,6 +278,13 @@ func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResp
 	return &response
 }
 
+func dumpJson(format string, jsonData []byte) {
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, jsonData, "", "  "); err == nil {
+		glog.V(2).Infof(format, string(prettyJSON.Bytes()))
+	}
+}
+
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	var body []byte
 	if r.Body != nil {
@@ -295,13 +306,6 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		return
 	}
 
-	if glog.V(3) {
-		var prettyJSON bytes.Buffer
-		if err := json.Indent(&prettyJSON, body, "", "  "); err == nil {
-			glog.V(3).Infof("Handling request: %s", string(prettyJSON.Bytes()))
-		}
-	}
-
 	ar := v1beta1.AdmissionReview{}
 	if _, _, err := decoder.Decode(body, nil, &ar); err != nil {
 		glog.Error(err)
@@ -309,18 +313,21 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		return
 	}
 
-	reviewResponse := admit(ar)
+	reviewResponse, trackDetails := admit(ar)
 
 	response := v1beta1.AdmissionReview{}
 	response.Response = reviewResponse
 	response.Response.UID = ar.Request.UID
 
-	if glog.V(2) && len(reviewResponse.Patch) > 0 {
-		var prettyJSON bytes.Buffer
-		if err := json.Indent(&prettyJSON, reviewResponse.Patch, "", "  "); err == nil {
-			glog.V(2).Infof("Sending patch response: %s", string(prettyJSON.Bytes()))
+	if glog.V(2) {
+		if trackDetails {
+			dumpJson("Handling request: %s", body)
+		}
+		if len(reviewResponse.Patch) > 0 {
+			dumpJson("Sending patch response: %s", reviewResponse.Patch)
 		}
 	}
+
 	resp, err := json.Marshal(response)
 	if err != nil {
 		glog.Error(err)
