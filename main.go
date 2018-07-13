@@ -53,19 +53,21 @@ type appInsightsSecret struct {
 type admitFunc func(v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
 
 var (
-	// CONSIDER It may be more robust to _also_ periodically load information about all secrets in the system and compare this
-	// information with what we have cached in the aiSecrets slice
+	// TODO: periodically load information about all secrets in the system
+	// and compare this information with what we have cached in the aiSecrets slice.
 
 	aiSecrets     = make([]appInsightsSecret, 1)
 	aiSecretsLock sync.RWMutex
 
 	// AllowUnchanged is a standard response instructing Kubernetes to allow the object in its original form
+	// NOTE: this webhook should never PREVENT any operation from happening, so in case of most unexpected errors
+	// we log the error, but then return AllowUnchanged. Only fatal errors return an actuall admission error response.
 	AllowUnchanged = v1beta1.AdmissionResponse{Allowed: true}
 
 	decoder = serializer.NewCodecFactory(runtime.NewScheme()).UniversalDeserializer()
 )
 
-func toAdmissionResponse(err error) *v1beta1.AdmissionResponse {
+func toErrorResponse(err error) *v1beta1.AdmissionResponse {
 	return &v1beta1.AdmissionResponse{
 		Result: &metav1.Status{
 			Message: err.Error(),
@@ -76,17 +78,16 @@ func toAdmissionResponse(err error) *v1beta1.AdmissionResponse {
 func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	secretResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 	if currentResource := ar.Request.Resource; currentResource != secretResource {
-		err := fmt.Errorf("Expected resource to be a secret but it is a '%s' (group '%s', version %s)",
+		glog.Warningf("Expected resource to be a secret but it is a '%s' (group '%s', version %s)",
 			currentResource.Resource, currentResource.Group, currentResource.Version)
-		glog.Error(err)
-		return toAdmissionResponse(err)
+		return &AllowUnchanged
 	}
 
 	raw := ar.Request.Object.Raw
 	secret := corev1.Secret{}
 	if _, _, err := decoder.Decode(raw, nil, &secret); err != nil {
 		glog.Error(err)
-		return toAdmissionResponse(err)
+		return &AllowUnchanged
 	}
 
 	operation := ar.Request.Operation
@@ -102,7 +103,7 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		oldSecret := corev1.Secret{}
 		if _, _, err := decoder.Decode(ar.Request.OldObject.Raw, nil, &oldSecret); err != nil {
 			glog.Error(err)
-			return toAdmissionResponse(err)
+			return &AllowUnchanged
 		}
 
 		handleSecretRemoval(oldSecret)
@@ -175,10 +176,9 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 
 	podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 	if currentResource := ar.Request.Resource; currentResource != podResource {
-		err := fmt.Errorf("Expected resource to be a oid but it is a '%s' (group '%s', version %s)",
+		glog.Warningf("Expected resource to be a pod but it is a '%s' (group '%s', version %s)",
 			currentResource.Resource, currentResource.Group, currentResource.Version)
-		glog.Error(err)
-		return toAdmissionResponse(err)
+		return &AllowUnchanged
 	}
 
 	// Note: for the "update" operation ar.Request.Object is the "new" object vs. ar.Request.OldObject.
@@ -187,7 +187,7 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	pod := corev1.Pod{}
 	if _, _, err := decoder.Decode(raw, nil, &pod); err != nil {
 		glog.Error(err)
-		return toAdmissionResponse(err)
+		return &AllowUnchanged
 	}
 	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
 
@@ -225,7 +225,7 @@ func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResp
 	response.Allowed = true
 	patchList := ""
 
-	for cIndex, container := range pod.Spec.Containers {
+	for containerIndex, container := range pod.Spec.Containers {
 
 		// Make sure we do not patch if the AppInsights instrumentation key is already set on the pod
 		iKeyVarExists := false
@@ -246,7 +246,7 @@ func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResp
 		if len(patchList) > 0 {
 			patchList += ",\n"
 		}
-		patchList += fmt.Sprintf(addIKeyVarPatch, cIndex, aiSecrets[secretIndex].Name)
+		patchList += fmt.Sprintf(addIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
 	}
 
 	if len(patchList) > 0 {
@@ -290,18 +290,18 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		}
 	}
 
-	var reviewResponse *v1beta1.AdmissionResponse
 	ar := v1beta1.AdmissionReview{}
 	if _, _, err := decoder.Decode(body, nil, &ar); err != nil {
 		glog.Error(err)
-		reviewResponse = &v1beta1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
-	} else {
-		reviewResponse = admit(ar)
+		http.Error(w, "Could not decode the request as AdmissionReview", http.StatusBadRequest)
+		return
 	}
+
+	reviewResponse := admit(ar)
+
+	response := v1beta1.AdmissionReview{}
+	response.Response = reviewResponse
+	response.Response.UID = ar.Request.UID
 
 	if glog.V(2) && len(reviewResponse.Patch) > 0 {
 		var prettyJSON bytes.Buffer
@@ -309,16 +309,6 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 			glog.V(2).Infof("Sending patch response: %s", string(prettyJSON.Bytes()))
 		}
 	}
-
-	response := v1beta1.AdmissionReview{}
-	if reviewResponse != nil {
-		response.Response = reviewResponse
-		response.Response.UID = ar.Request.UID
-	}
-	// reset the Object and OldObject, they are not needed in a response.
-	ar.Request.Object = runtime.RawExtension{}
-	ar.Request.OldObject = runtime.RawExtension{}
-
 	resp, err := json.Marshal(response)
 	if err != nil {
 		glog.Error(err)
