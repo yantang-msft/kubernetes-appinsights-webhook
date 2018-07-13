@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 
 	"github.com/golang/glog"
 	"k8s.io/api/admission/v1beta1"
@@ -53,11 +56,13 @@ var (
 	// CONSIDER It may be more robust to _also_ periodically load information about all secrets in the system and compare this
 	// information with what we have cached in the aiSecrets slice
 
-	aiSecrets     []appInsightsSecret
+	aiSecrets     = make([]appInsightsSecret, 1)
 	aiSecretsLock sync.RWMutex
 
 	// AllowUnchanged is a standard response instructing Kubernetes to allow the object in its original form
-	AllowUnchanged v1beta1.AdmissionResponse
+	AllowUnchanged = v1beta1.AdmissionResponse{Allowed: true}
+
+	decoder = serializer.NewCodecFactory(runtime.NewScheme()).UniversalDeserializer()
 )
 
 func toAdmissionResponse(err error) *v1beta1.AdmissionResponse {
@@ -79,7 +84,7 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 
 	raw := ar.Request.Object.Raw
 	secret := corev1.Secret{}
-	if err := json.Unmarshal(raw, &secret); err != nil {
+	if _, _, err := decoder.Decode(raw, nil, &secret); err != nil {
 		glog.Error(err)
 		return toAdmissionResponse(err)
 	}
@@ -95,7 +100,7 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		glog.V(2).Infof("Secret %s.%s is being updated", secret.Namespace, secret.Name)
 
 		oldSecret := corev1.Secret{}
-		if err := json.Unmarshal(ar.Request.OldObject.Raw, &oldSecret); err != nil {
+		if _, _, err := decoder.Decode(ar.Request.OldObject.Raw, nil, &oldSecret); err != nil {
 			glog.Error(err)
 			return toAdmissionResponse(err)
 		}
@@ -180,7 +185,7 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	// So whether it is a "create" operation, or "update" operation, ar.Request.Object is the right one to examine.
 	raw := ar.Request.Object.Raw
 	pod := corev1.Pod{}
-	if err := json.Unmarshal(raw, &pod); err != nil {
+	if _, _, err := decoder.Decode(raw, nil, &pod); err != nil {
 		glog.Error(err)
 		return toAdmissionResponse(err)
 	}
@@ -264,18 +269,30 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 			body = data
 		}
 	}
+	if len(body) == 0 {
+		glog.Error("No request body found")
+		http.Error(w, "No request body found", http.StatusBadRequest)
+		return
+	}
 
 	// verify the content type is accurate
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/json" {
 		glog.Errorf("contentType=%s, expect application/json", contentType)
+		http.Error(w, "invalid Content-Type, want `application/json`", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	glog.V(2).Info(fmt.Sprintf("Handling request: %v", body))
+	if glog.V(2) {
+		var prettyJSON bytes.Buffer
+		if err := json.Indent(&prettyJSON, body, "", "  "); err == nil {
+			glog.V(2).Infof("Handling request: %s", string(prettyJSON.Bytes()))
+		}
+	}
+
 	var reviewResponse *v1beta1.AdmissionResponse
 	ar := v1beta1.AdmissionReview{}
-	if err := json.Unmarshal(body, &ar); err != nil {
+	if _, _, err := decoder.Decode(body, nil, &ar); err != nil {
 		glog.Error(err)
 		reviewResponse = &v1beta1.AdmissionResponse{
 			Result: &metav1.Status{
@@ -285,7 +302,13 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	} else {
 		reviewResponse = admit(ar)
 	}
-	glog.V(2).Info(fmt.Sprintf("Sending response: %v", reviewResponse))
+
+	if glog.V(2) && len(reviewResponse.Patch) > 0 {
+		var prettyJSON bytes.Buffer
+		if err := json.Indent(&prettyJSON, reviewResponse.Patch, "", "  "); err == nil {
+			glog.V(2).Infof("Sending patch response: %s", string(prettyJSON.Bytes()))
+		}
+	}
 
 	response := v1beta1.AdmissionReview{}
 	if reviewResponse != nil {
@@ -299,9 +322,13 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	resp, err := json.Marshal(response)
 	if err != nil {
 		glog.Error(err)
+		http.Error(w, fmt.Sprintf("Could not encode response: %v", err), http.StatusInternalServerError)
+		return
 	}
+
 	if _, err := w.Write(resp); err != nil {
 		glog.Error(err)
+		http.Error(w, fmt.Sprintf("Could not write response: %v", err), http.StatusInternalServerError)
 	}
 }
 
@@ -329,10 +356,6 @@ func main() {
 	base := filepath.Dir(exec)
 	certFile := filepath.Join(base, "certs/tls.crt")
 	keyFile := filepath.Join(base, "certs/tls.key")
-
-	AllowUnchanged = v1beta1.AdmissionResponse{Allowed: true}
-
-	aiSecrets = make([]appInsightsSecret, 1)
 
 	http.HandleFunc("/secrets", serveSecrets)
 	http.HandleFunc("/mutating-pods", serveMutatePods)
