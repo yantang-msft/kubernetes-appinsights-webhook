@@ -41,6 +41,9 @@ const (
 
 	// IKeyVarName is the well-known name for Application Insights insrumentation key environment variable
 	IKeyVarName string = "APPINSIGHTS_INSTRUMENTATIONKEY"
+
+	// KubeSystemNamespace is the Kubernetes system namespace name. We disregard objects in that namespace.
+	KubeSystemNamespace = "kube-system"
 )
 
 // Data about a secret that contains Application Insights instrumentation key and other AppInsights configuration data.
@@ -87,6 +90,10 @@ func admitSecrets(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	secret := corev1.Secret{}
 	if _, _, err := decoder.Decode(raw, nil, &secret); err != nil {
 		glog.Error(err)
+		return &AllowUnchanged
+	}
+
+	if secret.Namespace == KubeSystemNamespace {
 		return &AllowUnchanged
 	}
 
@@ -189,6 +196,11 @@ func mutatePods(ar v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 		glog.Error(err)
 		return &AllowUnchanged
 	}
+
+	if pod.Namespace == KubeSystemNamespace {
+		return &AllowUnchanged
+	}
+
 	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
 
 	if ar.Request.Operation != v1beta1.Create && ar.Request.Operation != v1beta1.Update {
@@ -283,10 +295,10 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 		return
 	}
 
-	if glog.V(2) {
+	if glog.V(3) {
 		var prettyJSON bytes.Buffer
 		if err := json.Indent(&prettyJSON, body, "", "  "); err == nil {
-			glog.V(2).Infof("Handling request: %s", string(prettyJSON.Bytes()))
+			glog.V(3).Infof("Handling request: %s", string(prettyJSON.Bytes()))
 		}
 	}
 
