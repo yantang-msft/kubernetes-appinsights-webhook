@@ -31,13 +31,29 @@ const (
         "value": {
             "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
             "valueFrom" : {
-                "secretKeyRef: {
+                "secretKeyRef": {
                     "name": "%s",
                     "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
                 }
             }
         }
-    }`
+	}`
+
+	addEnvWithIKeyVarPatch string = `{
+        "op": "add",
+		"path": "/spec/containers/%d/env",
+        "value": [
+			{
+	            "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+    	        "valueFrom" : {
+        	        "secretKeyRef": {
+            	        "name": "%s",
+                	    "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
+                	}
+            	}
+			}
+		]
+	}`
 
 	// IKeyVarName is the well-known name for Application Insights insrumentation key environment variable
 	IKeyVarName string = "APPINSIGHTS_INSTRUMENTATIONKEY"
@@ -86,34 +102,37 @@ func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, tra
 		return &AllowUnchanged, true
 	}
 
-	raw := ar.Request.Object.Raw
 	secret := corev1.Secret{}
-	if _, _, err := decoder.Decode(raw, nil, &secret); err != nil {
-		glog.Error(err)
-		return &AllowUnchanged, true
-	}
-
-	if secret.Namespace == KubeSystemNamespace {
-		return &AllowUnchanged, false
-	}
-
+	oldSecret := corev1.Secret{}
 	operation := ar.Request.Operation
-	if operation == v1beta1.Create {
-		glog.V(2).Infof("Admitting new secret %s.%s", secret.Namespace, secret.Name)
-		trackDetails = handleSecretCreation(secret)
-	} else if operation == v1beta1.Delete {
-		glog.V(2).Infof("Secret %s.%s is being deleted", secret.Namespace, secret.Name)
-		trackDetails = handleSecretRemoval(secret)
-	} else if operation == v1beta1.Update {
-		glog.V(2).Infof("Secret %s.%s is being updated", secret.Namespace, secret.Name)
 
-		oldSecret := corev1.Secret{}
+	if operation == v1beta1.Create || operation == v1beta1.Update {
+		if _, _, err := decoder.Decode(ar.Request.Object.Raw, nil, &secret); err != nil {
+			glog.Error(err)
+			return &AllowUnchanged, true
+		}
+	}
+	if operation == v1beta1.Update {
 		if _, _, err := decoder.Decode(ar.Request.OldObject.Raw, nil, &oldSecret); err != nil {
 			glog.Error(err)
 			return &AllowUnchanged, true
 		}
+	}
 
-		interestingRemoval := handleSecretRemoval(oldSecret)
+	if secret.Namespace == KubeSystemNamespace || oldSecret.Name == KubeSystemNamespace {
+		return &AllowUnchanged, false
+	}
+
+	if operation == v1beta1.Create {
+		glog.V(2).Infof("Admitting new secret %s.%s", secret.Namespace, secret.Name)
+		trackDetails = handleSecretCreation(secret)
+	} else if operation == v1beta1.Delete {
+		glog.V(2).Infof("Secret %s.%s is being deleted", ar.Request.Namespace, ar.Request.Name)
+		trackDetails = handleSecretRemoval(ar.Request.Name, ar.Request.Namespace)
+	} else if operation == v1beta1.Update {
+		glog.V(2).Infof("Secret %s.%s is being updated", secret.Namespace, secret.Name)
+
+		interestingRemoval := handleSecretRemoval(ar.Request.Name, ar.Request.Namespace)
 		interestingCreation := handleSecretCreation(secret)
 		trackDetails = interestingRemoval || interestingCreation
 	}
@@ -121,12 +140,7 @@ func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, tra
 	return &AllowUnchanged, trackDetails
 }
 
-func handleSecretRemoval(secret corev1.Secret) (trackDetails bool) {
-	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
-		// Secret does not contain AppInsights instrumentation key--not relevant to us.
-		return false
-	}
-
+func handleSecretRemoval(secretName string, secretNamespace string) (trackDetails bool) {
 	// Taking a lock now ensures stable iteration over aiSecrets
 	aiSecretsLock.Lock()
 	defer aiSecretsLock.Unlock()
@@ -134,8 +148,8 @@ func handleSecretRemoval(secret corev1.Secret) (trackDetails bool) {
 	newSecrets := make([]appInsightsSecret, len(aiSecrets))
 	i := 0
 	for _, aiSecret := range aiSecrets {
-		if aiSecret.Name == secret.Name && aiSecret.Namespace == secret.Namespace {
-			glog.V(2).Infof("Removing cached data for secret %s.%s", secret.Namespace, secret.Name)
+		if aiSecret.Name == secretName && aiSecret.Namespace == secretNamespace {
+			glog.V(2).Infof("Removing cached data for secret %s.%s", secretNamespace, secretName)
 			trackDetails = true
 			continue
 		}
@@ -192,11 +206,15 @@ func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, track
 		return &AllowUnchanged, true
 	}
 
+	if ar.Request.Operation != v1beta1.Create && ar.Request.Operation != v1beta1.Update {
+		glog.V(2).Infof("Operation on the pod is %s, allowing unchanged", ar.Request.Operation)
+		return &AllowUnchanged, false
+	}
+
 	// Note: for the "update" operation ar.Request.Object is the "new" object vs. ar.Request.OldObject.
 	// So whether it is a "create" operation, or "update" operation, ar.Request.Object is the right one to examine.
-	raw := ar.Request.Object.Raw
 	pod := corev1.Pod{}
-	if _, _, err := decoder.Decode(raw, nil, &pod); err != nil {
+	if _, _, err := decoder.Decode(ar.Request.Object.Raw, nil, &pod); err != nil {
 		glog.Error(err)
 		return &AllowUnchanged, true
 	}
@@ -205,12 +223,17 @@ func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, track
 		return &AllowUnchanged, false
 	}
 
-	glog.V(2).Infof("Admitting pod %s.%s ...", pod.Namespace, pod.Name)
-
-	if ar.Request.Operation != v1beta1.Create && ar.Request.Operation != v1beta1.Update {
-		glog.V(2).Infof("Operation on the pod %s is %s, allowing unchanged", pod.Name, ar.Request.Operation)
-		return &AllowUnchanged, false
+	var podName string
+	switch {
+	case len(pod.Name) > 0:
+		podName = pod.Name
+	case len(pod.GenerateName) > 0:
+		podName = pod.GenerateName
+	default:
+		podName = "(unknown)"
 	}
+
+	glog.V(2).Infof("Admitting pod %s.%s ...", ar.Request.Namespace, podName)
 
 	aiSecretsLock.RLock()
 	defer aiSecretsLock.RUnlock()
@@ -226,17 +249,17 @@ func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, track
 			continue
 		}
 
-		if secret.Namespace == pod.Namespace && selector.Matches(labels.Set(pod.Labels)) {
-			glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s", secret.Name, pod.Name)
-			return createPatchResponse(pod, i), true
+		if secret.Namespace == ar.Request.Namespace && selector.Matches(labels.Set(pod.Labels)) {
+			glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s.%s", secret.Name, ar.Request.Namespace, podName)
+			return createPatchResponse(pod, podName, i), true
 		}
 	}
 
-	glog.V(2).Infof("No matching secrets found for pod %s.%s, allowing unchanged", pod.Namespace, pod.Name)
+	glog.V(2).Infof("No matching secrets found for pod %s.%s, allowing unchanged", ar.Request.Namespace, podName)
 	return &AllowUnchanged, false
 }
 
-func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResponse {
+func createPatchResponse(pod corev1.Pod, podName string, secretIndex int) *v1beta1.AdmissionResponse {
 	response := v1beta1.AdmissionResponse{}
 	response.Allowed = true
 	patchList := ""
@@ -249,7 +272,7 @@ func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResp
 			if envVar.Name == IKeyVarName {
 				glog.V(2).Infof(
 					"Container %s of pod %s already has an instrumentation key variable, skipping",
-					container.Name, pod.Name)
+					container.Name, podName)
 
 				iKeyVarExists = true
 				break
@@ -262,23 +285,28 @@ func createPatchResponse(pod corev1.Pod, secretIndex int) *v1beta1.AdmissionResp
 		if len(patchList) > 0 {
 			patchList += ",\n"
 		}
-		patchList += fmt.Sprintf(addIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
+
+		if len(container.Env) > 0 {
+			patchList += fmt.Sprintf(addIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
+		} else {
+			patchList += fmt.Sprintf(addEnvWithIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
+		}
 	}
 
 	if len(patchList) > 0 {
 		patchStr := "[\n" + patchList + "\n]"
-		glog.V(2).Infof("Patching request for pod %s is: %s", pod.Name, patchStr)
+		glog.V(2).Infof("Patching request for pod %s is: %s", podName, patchStr)
 		response.Patch = []byte(patchStr)
 		pt := v1beta1.PatchTypeJSONPatch
 		response.PatchType = &pt
 	} else {
-		glog.V(2).Infof("None of the containers inside pod %s required patching to add instrumentation key variable", pod.Name)
+		glog.V(2).Infof("None of the containers inside pod %s required patching to add instrumentation key variable", podName)
 	}
 
 	return &response
 }
 
-func dumpJson(format string, jsonData []byte) {
+func dumpJSON(format string, jsonData []byte) {
 	var prettyJSON bytes.Buffer
 	if err := json.Indent(&prettyJSON, jsonData, "", "  "); err == nil {
 		glog.V(2).Infof(format, string(prettyJSON.Bytes()))
@@ -321,10 +349,10 @@ func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 
 	if glog.V(2) {
 		if trackDetails {
-			dumpJson("Handling request: %s", body)
+			dumpJSON("The raw request was: %s", body)
 		}
 		if len(reviewResponse.Patch) > 0 {
-			dumpJson("Sending patch response: %s", reviewResponse.Patch)
+			dumpJSON("Sending patch response: %s", reviewResponse.Patch)
 		}
 	}
 
