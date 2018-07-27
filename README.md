@@ -11,6 +11,7 @@ into the pod, using environment variables. It works in a way similar to PodPrese
 
 # Build 
 
+    go get // (only before first build)
     make
 
 # Setup

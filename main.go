@@ -14,14 +14,15 @@ import (
 	"path/filepath"
 	"sync"
 
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-
+	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
+
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
 const (
@@ -177,12 +178,12 @@ func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
 		return false
 	}
 
-	glog.V(2).Infof("Adding %s to list of secrets with AppInsights key information", secret.Name)
+	glog.V(2).Infof("Adding %s to list of secrets with AppInsights information", secret.Name)
 	ais := appInsightsSecret{}
 	ais.Name = secret.Name
 	ais.Namespace = secret.Namespace
-	err := json.Unmarshal([]byte(aiAnnotation), &ais.Annotation)
-	if err == nil {
+	err := yaml.Unmarshal([]byte(aiAnnotation), &ais.Annotation)
+	if err != nil {
 		glog.Warning("Could not parse Application Insights annotation on secret %s: %s", secret.Name, err)
 		return true
 	}
