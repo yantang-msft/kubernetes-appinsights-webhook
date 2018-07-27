@@ -60,13 +60,21 @@ const (
 
 	// KubeSystemNamespace is the Kubernetes system namespace name. We disregard objects in that namespace.
 	KubeSystemNamespace = "kube-system"
+
+	// AppInsightsInfoAnnotation contains instrumentation key and other information related to sending telemetry to Azure Application Insights
+	AppInsightsInfoAnnotation = "azure.microsoft.com/applicationinsights-info"
 )
 
-// Data about a secret that contains Application Insights instrumentation key and other AppInsights configuration data.
+// Data stored in the applicationinsights-info annotation on a secret that is used for Application Insights data injection
+type appInsightsAnnotation struct {
+	Selectors []metav1.LabelSelector
+}
+
+// Data the webhook tracks about a secret that is used for Application Insights data injection
 type appInsightsSecret struct {
-	Selector  metav1.LabelSelector
-	Name      string
-	Namespace string
+	Annotation appInsightsAnnotation
+	Name       string
+	Namespace  string
 }
 
 type admitFunc func(v1beta1.AdmissionReview) (response *v1beta1.AdmissionResponse, trackDetails bool)
@@ -163,14 +171,9 @@ func handleSecretRemoval(secretName string, secretNamespace string) (trackDetail
 }
 
 func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
-	if _, iKeyPresent := secret.Data[IKeyVarName]; !iKeyPresent {
-		glog.V(2).Infof("Secret %s does not have %s in its data", secret.Name, IKeyVarName)
-		return false
-	}
-
-	if len(secret.Labels) == 0 {
-		glog.Warningf("Cannot identify pods to use with secret %s.%s because the secret does not have any labels",
-			secret.Namespace, secret.Name)
+	aiAnnotation, aiAnnotationPresent := secret.Annotations[AppInsightsInfoAnnotation]
+	if !aiAnnotationPresent {
+		glog.V(2).Infof("Secret %s does not have Application Insights annotation", secret.Name)
 		return false
 	}
 
@@ -178,15 +181,14 @@ func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
 	ais := appInsightsSecret{}
 	ais.Name = secret.Name
 	ais.Namespace = secret.Namespace
-	// Here we will just gather all the labels on the secret and use them as a label selector to identify the pods
-	// that should be injected with instrumentation key information
-	//
-	// CONSIDER having a well-known annotation that contains a label selector that identifies the pods explicitly.
-	// This annotation could be optional, and the "use secret labels as a label selector" could be used by default
-	ais.Selector = metav1.LabelSelector{}
-	for lName, lValue := range secret.Labels {
-		glog.V(2).Infof("Pods that use secret %s must have label %s with value %s", secret.Name, lName, lValue)
-		metav1.AddLabelToSelector(&ais.Selector, lName, lValue)
+	err := json.Unmarshal([]byte(aiAnnotation), &ais.Annotation)
+	if err == nil {
+		glog.Warning("Could not parse Application Insights annotation on secret %s: %s", secret.Name, err)
+		return true
+	}
+	if len(ais.Annotation.Selectors) == 0 {
+		glog.Warning("Application Insights annotation on secret %s has no selectors. The annotation will have no effect", secret.Name)
+		return true
 	}
 
 	aiSecretsLock.Lock()
@@ -239,19 +241,27 @@ func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, track
 	defer aiSecretsLock.RUnlock()
 
 	// Iterate aiSecrets slice backwards so that latest secrets are preferred
-	for i := len(aiSecrets) - 1; i >= 0; i-- {
-		secret := aiSecrets[i]
-		selector, err := metav1.LabelSelectorAsSelector(&secret.Selector)
-		if err != nil {
-			glog.Warningf(
-				"Unexpected error when trying to use secret %s.%s. One of the stored LabelSelectors could not be converted to a Selector. %s",
-				secret.Namespace, secret.Name, err)
+	for si := len(aiSecrets) - 1; si >= 0; si-- {
+		secret := aiSecrets[si]
+
+		if secret.Namespace != ar.Request.Namespace {
 			continue
 		}
 
-		if secret.Namespace == ar.Request.Namespace && selector.Matches(labels.Set(pod.Labels)) {
-			glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s.%s", secret.Name, ar.Request.Namespace, podName)
-			return createPatchResponse(pod, podName, i), true
+		for lsi, labelSelector := range secret.Annotation.Selectors {
+			selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
+			if err != nil {
+				glog.Warningf(
+					"Unexpected error when trying to use secret %s.%s. LabelSelector nr %d (%s) could not be converted to a Selector. %s",
+					secret.Namespace, secret.Name, lsi, metav1.FormatLabelSelector(&labelSelector), err)
+				continue
+			}
+
+			if selector.Matches(labels.Set(pod.Labels)) {
+				glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s.%s (selector nr %d matches)",
+					secret.Name, ar.Request.Namespace, podName, lsi)
+				return createPatchResponse(pod, podName, si), true
+			}
 		}
 	}
 
