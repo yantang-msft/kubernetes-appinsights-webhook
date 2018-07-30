@@ -1,3 +1,37 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Chart.Name }}-cluster-role
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups: [""]
+  resources:
+  - secrets
+  verbs: ["get", "list"]
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name:  {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name:  {{ .Chart.Name }}-cluster-role-binding
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name:  {{ .Chart.Name }}-cluster-role
+subjects:
+- kind: ServiceAccount
+  name:  {{ .Chart.Name }}
+  namespace: {{ .Release.Namespace }}
+
+---
 kind: Deployment
 apiVersion: apps/v1
 metadata:
@@ -19,6 +53,7 @@ spec:
         release: {{ .Release.Name }}
         role: webhook-svc-impl
     spec:
+      serviceAccountName: {{ .Chart.Name }}
       containers:
       - name: webhook
         image: {{ .Values.webhook.image }}
