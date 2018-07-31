@@ -11,8 +11,11 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
@@ -392,6 +395,30 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func repeat(action func(), delay time.Duration, done chan bool) chan struct{} {
+	stop := make(chan struct{})
+
+	go func() {
+		for {
+			action()
+
+			select {
+			case <-time.After(delay):
+				// Perform another iteration
+			case <-stop:
+				done <- true
+				return
+			}
+		}
+	}()
+
+	return stop
+}
+
+func refreshSecrets() {
+	glog.V(2).Info("Querying Kubernetes for new secrets...")
+}
+
 func main() {
 	flag.Parse() // Required to parse glog flags
 
@@ -415,8 +442,30 @@ func main() {
 		TLSConfig: configTLS(certFile, keyFile, clientset),
 	}
 
-	glog.V(2).Info("Certificates loaded. Listening for requests...")
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		glog.Fatal(err)
-	}
+	allDone := make(chan bool)
+	signalC := make(chan os.Signal, 1)
+
+	secretRefresh := repeat(refreshSecrets, time.Duration(15)*time.Second, allDone)
+
+	go func() {
+		glog.V(2).Info("Certificates loaded. Listening for requests...")
+		if err := server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			glog.Error(err)
+		}
+		allDone <- true
+	}()
+
+	signal.Notify(signalC, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalC
+		glog.V(2).Info("Exiting gracefully...")
+		close(secretRefresh)
+		if err := server.Close(); err != nil {
+			glog.Error(err)
+		}
+	}()
+
+	<-allDone // HTTPS server
+	<-allDone // Secret refresher
+	glog.V(2).Info("Shutdown complete")
 }
