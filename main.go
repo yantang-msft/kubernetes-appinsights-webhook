@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,11 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
 
 	"k8s.io/api/admission/v1beta1"
@@ -70,18 +69,6 @@ const (
 	AppInsightsInfoAnnotation = "azure.microsoft.com/applicationinsights-info"
 )
 
-// Data stored in the applicationinsights-info annotation on a secret that is used for Application Insights data injection
-type appInsightsAnnotation struct {
-	Selectors []metav1.LabelSelector
-}
-
-// Data the webhook tracks about a secret that is used for Application Insights data injection
-type appInsightsSecret struct {
-	Annotation appInsightsAnnotation
-	Name       string
-	Namespace  string
-}
-
 type admitFunc func(v1beta1.AdmissionReview) (response *v1beta1.AdmissionResponse, trackDetails bool)
 
 var (
@@ -118,7 +105,6 @@ func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, tra
 	}
 
 	secret := corev1.Secret{}
-	oldSecret := corev1.Secret{}
 	operation := ar.Request.Operation
 
 	if operation == v1beta1.Create || operation == v1beta1.Update {
@@ -127,14 +113,8 @@ func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, tra
 			return &AllowUnchanged, true
 		}
 	}
-	if operation == v1beta1.Update {
-		if _, _, err := decoder.Decode(ar.Request.OldObject.Raw, nil, &oldSecret); err != nil {
-			glog.Error(err)
-			return &AllowUnchanged, true
-		}
-	}
 
-	if secret.Namespace == KubeSystemNamespace || oldSecret.Name == KubeSystemNamespace {
+	if secret.Namespace == KubeSystemNamespace {
 		return &AllowUnchanged, false
 	}
 
@@ -178,29 +158,17 @@ func handleSecretRemoval(secretName string, secretNamespace string) (trackDetail
 }
 
 func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
-	aiAnnotation, aiAnnotationPresent := secret.Annotations[AppInsightsInfoAnnotation]
-	if !aiAnnotationPresent {
-		glog.V(2).Infof("Secret %s does not have Application Insights annotation", secret.Name)
-		return false
-	}
-
-	glog.V(2).Infof("Adding %s to list of secrets with AppInsights information", secret.Name)
-	ais := appInsightsSecret{}
-	ais.Name = secret.Name
-	ais.Namespace = secret.Namespace
-	err := yaml.Unmarshal([]byte(aiAnnotation), &ais.Annotation)
+	ais, err := toAppInsightsSecretInfo(secret)
 	if err != nil {
-		glog.Warning("Could not parse Application Insights annotation on secret %s: %s", secret.Name, err)
-		return true
+		return true // Conversion failed--track details
 	}
-	if len(ais.Annotation.Selectors) == 0 {
-		glog.Warning("Application Insights annotation on secret %s has no selectors. The annotation will have no effect", secret.Name)
-		return true
+	if ais == nil {
+		return false // Secret does not contain Application Insights info
 	}
 
 	aiSecretsLock.Lock()
 	defer aiSecretsLock.Unlock()
-	aiSecrets = append(aiSecrets, ais)
+	aiSecrets = append(aiSecrets, *ais)
 	return true
 }
 
@@ -323,13 +291,6 @@ func createPatchResponse(pod corev1.Pod, podName string, secretIndex int) *v1bet
 	return &response
 }
 
-func dumpJSON(format string, jsonData []byte) {
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, jsonData, "", "  "); err == nil {
-		glog.V(2).Infof(format, string(prettyJSON.Bytes()))
-	}
-}
-
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
 	var body []byte
 	if r.Body != nil {
@@ -398,39 +359,35 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func repeat(action func() error, delay time.Duration, doneC chan error) chan struct{} {
-	stop := make(chan struct{})
-
-	go func() {
-		for {
-			if err := action(); err != nil {
-				doneC <- err
-				return
-			}
-
-			select {
-			case <-time.After(delay):
-				// Perform another iteration
-
-			case <-stop:
-				doneC <- nil
-				return
-			}
-		}
-	}()
-
-	return stop
-}
-
 func refreshSecrets() error {
 	glog.V(2).Info("Querying Kubernetes for new secrets...")
 
-	// TODO: examine secrets
-	// TODO: set timeout in ListOptions
-	_, err := clientset.CoreV1().Secrets("").List(metav1.ListOptions{})
+	var timeout int64 = 5
+	secrets, err := clientset.CoreV1().Secrets("").List(metav1.ListOptions{TimeoutSeconds: &timeout})
 	if err != nil {
-		return err
+		glog.Warningf("Could not refresh secret information: %v", err)
+		return nil
 	}
+
+	newSecrets := make([]appInsightsSecret, len(aiSecrets))
+
+	aiSecretsLock.Lock()
+	defer aiSecretsLock.Unlock()
+
+	for _, secret := range secrets.Items {
+		if secret.Namespace == KubeSystemNamespace {
+			continue
+		}
+
+		ais, err := toAppInsightsSecretInfo(secret)
+		if err != nil || ais == nil {
+			continue
+		}
+		newSecrets = append(newSecrets, *ais)
+	}
+
+	sort.Sort(byCreationTimestamp(newSecrets))
+	aiSecrets = newSecrets
 
 	return nil
 }
@@ -461,7 +418,7 @@ func main() {
 	doneC := make(chan error, 2)
 	signalC := make(chan os.Signal, 1)
 
-	secretRefreshC := repeat(refreshSecrets, time.Duration(15)*time.Second, doneC)
+	secretRefreshC := repeat(refreshSecrets, time.Duration(30)*time.Second, doneC)
 
 	go func() {
 		glog.V(2).Info("Certificates loaded. Listening for requests...")
