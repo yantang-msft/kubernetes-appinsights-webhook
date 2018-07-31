@@ -398,21 +398,22 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func repeat(action func() error, delay time.Duration, done chan error) chan struct{} {
+func repeat(action func() error, delay time.Duration, doneC chan error) chan struct{} {
 	stop := make(chan struct{})
 
 	go func() {
 		for {
 			if err := action(); err != nil {
-				done <- err
+				doneC <- err
 				return
 			}
 
 			select {
 			case <-time.After(delay):
 				// Perform another iteration
+
 			case <-stop:
-				done <- nil
+				doneC <- nil
 				return
 			}
 		}
@@ -424,6 +425,8 @@ func repeat(action func() error, delay time.Duration, done chan error) chan stru
 func refreshSecrets() error {
 	glog.V(2).Info("Querying Kubernetes for new secrets...")
 
+	// TODO: examine secrets
+	// TODO: set timeout in ListOptions
 	_, err := clientset.CoreV1().Secrets("").List(metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -455,17 +458,18 @@ func main() {
 		TLSConfig: configTLS(certFile, keyFile, clientset),
 	}
 
-	done := make(chan error, 2)
+	doneC := make(chan error, 2)
 	signalC := make(chan os.Signal, 1)
 
-	secretRefresh := repeat(refreshSecrets, time.Duration(15)*time.Second, done)
+	secretRefreshC := repeat(refreshSecrets, time.Duration(15)*time.Second, doneC)
 
 	go func() {
 		glog.V(2).Info("Certificates loaded. Listening for requests...")
 		if err := server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
-			done <- err
+			glog.Error(err)
+			doneC <- err
 		} else {
-			done <- nil
+			doneC <- nil
 		}
 	}()
 
@@ -476,18 +480,19 @@ func main() {
 		select {
 		case <-signalC:
 			glog.V(2).Info("Exiting gracefully...")
+			// Instruct the secret refresh process and the HTTPS server to shut down
+			close(secretRefreshC)
+			if err := server.Close(); err != nil {
+				glog.Error(err)
+			}
 
-		case err = <-done:
+		case err = <-doneC:
 			glog.Fatalf("Unexpected error occurred, aborting: %v", err)
 		}
 	}()
 
-	// Instruct the secret refresh process and the HTTPS server to shut down
-	close(secretRefresh)
-	if err := server.Close(); err != nil {
-		glog.Error(err)
-	}
-	<-done
-	<-done
+	// Wait for HTTPS server and secret refresh process to finish cleanup
+	<-doneC
+	<-doneC
 	glog.V(2).Info("Shutdown complete")
 }
