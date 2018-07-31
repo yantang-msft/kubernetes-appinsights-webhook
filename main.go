@@ -26,6 +26,7 @@ import (
 	labels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -96,6 +97,8 @@ var (
 	AllowUnchanged = v1beta1.AdmissionResponse{Allowed: true}
 
 	decoder = serializer.NewCodecFactory(runtime.NewScheme()).UniversalDeserializer()
+
+	clientset *kubernetes.Clientset
 )
 
 func toErrorResponse(err error) *v1beta1.AdmissionResponse {
@@ -395,18 +398,21 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func repeat(action func(), delay time.Duration, done chan bool) chan struct{} {
+func repeat(action func() error, delay time.Duration, done chan error) chan struct{} {
 	stop := make(chan struct{})
 
 	go func() {
 		for {
-			action()
+			if err := action(); err != nil {
+				done <- err
+				return
+			}
 
 			select {
 			case <-time.After(delay):
 				// Perform another iteration
 			case <-stop:
-				done <- true
+				done <- nil
 				return
 			}
 		}
@@ -415,8 +421,15 @@ func repeat(action func(), delay time.Duration, done chan bool) chan struct{} {
 	return stop
 }
 
-func refreshSecrets() {
+func refreshSecrets() error {
 	glog.V(2).Info("Querying Kubernetes for new secrets...")
+
+	_, err := clientset.CoreV1().Secrets("").List(metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func main() {
@@ -436,36 +449,45 @@ func main() {
 	http.HandleFunc("/mutating-pods", serveMutatePods)
 	http.HandleFunc("/health", serveHealth)
 
-	clientset := getClient()
+	clientset = getClient()
 	server := &http.Server{
 		Addr:      ":443",
 		TLSConfig: configTLS(certFile, keyFile, clientset),
 	}
 
-	allDone := make(chan bool)
+	done := make(chan error, 2)
 	signalC := make(chan os.Signal, 1)
 
-	secretRefresh := repeat(refreshSecrets, time.Duration(15)*time.Second, allDone)
+	secretRefresh := repeat(refreshSecrets, time.Duration(15)*time.Second, done)
 
 	go func() {
 		glog.V(2).Info("Certificates loaded. Listening for requests...")
 		if err := server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
-			glog.Error(err)
+			done <- err
+		} else {
+			done <- nil
 		}
-		allDone <- true
 	}()
 
 	signal.Notify(signalC, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-signalC
-		glog.V(2).Info("Exiting gracefully...")
-		close(secretRefresh)
-		if err := server.Close(); err != nil {
-			glog.Error(err)
+		var err error
+
+		select {
+		case <-signalC:
+			glog.V(2).Info("Exiting gracefully...")
+
+		case err = <-done:
+			glog.Fatalf("Unexpected error occurred, aborting: %v", err)
 		}
 	}()
 
-	<-allDone // HTTPS server
-	<-allDone // Secret refresher
+	// Instruct the secret refresh process and the HTTPS server to shut down
+	close(secretRefresh)
+	if err := server.Close(); err != nil {
+		glog.Error(err)
+	}
+	<-done
+	<-done
 	glog.V(2).Info("Shutdown complete")
 }
