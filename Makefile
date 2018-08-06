@@ -1,6 +1,6 @@
 
 IMAGE = appinsights-webhook
-TAG = 0.1
+TAG = latest
 
 build:
 	GOOS=linux GOARCH=amd64 go build -a -o appinsights-webhook .

@@ -57,7 +57,7 @@ spec:
       containers:
       - name: webhook
         image: {{ .Values.webhook.image }}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         args: {{ .Values.webhook.cmdargs }}
         livenessProbe:
           httpGet:
