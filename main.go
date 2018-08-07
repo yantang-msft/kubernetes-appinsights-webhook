@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,41 +30,174 @@ import (
 )
 
 const (
-	addIKeyVarPatch string = `{
+	addIKeyPlainTextPatch string = ` {
         "op": "add",
         "path": "/spec/containers/%d/env/-",
         "value": {
             "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
-            "valueFrom" : {
+            "value": "%s"
+        }
+    }
+	`
+
+	addEnvWithIKeyPlainTextPatch string = ` {
+        "op": "add",
+        "path": "/spec/containers/%d/env",
+        "value": [
+            {
+                "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+                "value": "%s"
+            }
+        ]
+    }
+    `
+
+	addIKeyFromSecretPatch string = `{
+        "op": "add",
+        "path": "/spec/containers/%d/env/-",
+        "value": {
+            "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+            "valueFrom": {
                 "secretKeyRef": {
                     "name": "%s",
                     "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
                 }
             }
         }
-	}`
+    }`
 
-	addEnvWithIKeyVarPatch string = `{
+	addEnvWithIKeyFromSecretPatch string = `{
         "op": "add",
-		"path": "/spec/containers/%d/env",
+        "path": "/spec/containers/%d/env",
         "value": [
-			{
-	            "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
-    	        "valueFrom" : {
-        	        "secretKeyRef": {
-            	        "name": "%s",
-                	    "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
-                	}
-            	}
-			}
-		]
-	}`
+            {
+                "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "%s",
+                        "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
+                    }
+                }
+            }
+        ]
+    }`
+
+	addEndpointPatch string = ` {
+        "op": "add",
+        "path": "/spec/containers/%d/env/-",
+        "value": {
+            "name": "APPINSIGHTS_ENDPOINT",
+            "value": "%s"
+        }
+    }
+	`
+
+	updateEndpointPatch string = ` {
+        "op": "replace",
+        "path": "/spec/containers/%d/env/%d",
+        "value": {
+            "name": "APPINSIGHTS_ENDPOINT",
+            "value": "%s"
+        }
+    }
+	`
+
+	// TODO: need a better way to detect whether we need to add the volume mount
+	addFluentdSidecarPlainTextIKeyPatch string = ` {
+        "op": "add",
+        "path": "/spec/containers/-",
+        "value": {
+            "name": "fluentdsidecar",
+            "image": "yanmingacr.azurecr.io/fluentdsidecar",
+            "env": [{
+                    "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+                    "value": "%s"
+                }, {
+                    "name": "NAMESPACE_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.namespace"
+                        }
+                    }
+                }, {
+                    "name": "POD_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.name"
+                        }
+                    }
+                }, {
+                    "name": "SOURCE_CONTAINER_NAME",
+                    "value": "%s"
+                }, {
+                    "name": "FLUENTD_OPT",
+                    "value": "-v"
+            }],
+            "volumeMounts": [
+                {
+                    "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                    "name": "%s",
+                    "readOnly": true
+                }
+            ]
+        }
+    }
+	`
+
+	// TODO: keep this snippet up to date
+	addFluentdSidecarIKeyFromSecretPatch string = ` {
+        "op": "add",
+        "path": "/spec/containers/-",
+        "value": {
+            "name": "fluentdsidecar",
+            "image": "yanmingacr.azurecr.io/fluentdsidecar",
+            "env": [{
+                    "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": "%s",
+                            "key": "APPINSIGHTS_INSTRUMENTATIONKEY"
+                        }
+                    }
+                }, {
+                    "name": "NAMESPACE_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.namespace"
+                        }
+                    }
+                }, {
+                    "name": "POD_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.name"
+                        }
+                    }
+                }, {
+                    "name": "SOURCE_CONTAINER_NAME",
+                    "value": "%s"
+                }, {
+                    "name": "FLUENTD_OPT",
+                    "value": "-v"
+            }]
+        }
+    }
+	`
 
 	// IKeyVarName is the well-known name for Application Insights insrumentation key environment variable
 	IKeyVarName string = "APPINSIGHTS_INSTRUMENTATIONKEY"
 
+	// EndpointVarName is the well-know name for Application Insights SDK's endpoint address
+	EndpointVarName string = "APPINSIGHTS_ENDPOINT"
+
+	// TODO: We need dynamic endpoint address if there are multiple containers
+	EndpointVarValue string = "http://localhost:8887/ApplicationInsightsHttpChannel"
+
 	// KubeSystemNamespace is the Kubernetes system namespace name. We disregard objects in that namespace.
 	KubeSystemNamespace = "kube-system"
+
+	// AppInsightsClusterResource is the secret name that store the ikey of the cluster Application Insights resource
+	AppInsightsClusterResource = "applicationinsights-cluster-resource"
 
 	// AppInsightsInfoAnnotation contains instrumentation key and other information related to sending telemetry to Azure Application Insights
 	AppInsightsInfoAnnotation = "azure.microsoft.com/applicationinsights-info"
@@ -75,8 +209,9 @@ var (
 	// TODO: periodically load information about all secrets in the system
 	// and compare this information with what we have cached in the aiSecrets slice.
 
-	aiSecrets     = make([]appInsightsSecret, 1)
-	aiSecretsLock sync.RWMutex
+	aiSecrets       = make([]appInsightsSecret, 1)
+	aiClusterSecret appInsightsSecret
+	aiSecretsLock   sync.RWMutex
 
 	// AllowUnchanged is a standard response instructing Kubernetes to allow the object in its original form
 	// NOTE: this webhook should never PREVENT any operation from happening, so in case of most unexpected errors
@@ -112,10 +247,6 @@ func admitSecrets(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, tra
 			glog.Error(err)
 			return &AllowUnchanged, true
 		}
-	}
-
-	if secret.Namespace == KubeSystemNamespace {
-		return &AllowUnchanged, false
 	}
 
 	if operation == v1beta1.Create {
@@ -158,17 +289,26 @@ func handleSecretRemoval(secretName string, secretNamespace string) (trackDetail
 }
 
 func handleSecretCreation(secret corev1.Secret) (trackDetails bool) {
-	ais, err := toAppInsightsSecretInfo(secret)
-	if err != nil {
-		return true // Conversion failed--track details
-	}
-	if ais == nil {
-		return false // Secret does not contain Application Insights info
+	if secret.Namespace == KubeSystemNamespace && secret.Name == AppInsightsClusterResource {
+		aiClusterSecret.Name = secret.Name
+		aiClusterSecret.Namespace = secret.Namespace
+		aiClusterSecret.CreationTimestamp = secret.CreationTimestamp
+		// The secret data is already decoded
+		aiClusterSecret.InstrumentationKey = string(secret.Data[IKeyVarName])
+	} else {
+		ais, err := toAppInsightsSecretInfo(secret)
+		if err != nil {
+			return true // Conversion failed--track details
+		}
+		if ais == nil {
+			return false // Secret does not contain Application Insights info
+		}
+
+		aiSecretsLock.Lock()
+		defer aiSecretsLock.Unlock()
+		aiSecrets = append(aiSecrets, *ais)
 	}
 
-	aiSecretsLock.Lock()
-	defer aiSecretsLock.Unlock()
-	aiSecrets = append(aiSecrets, *ais)
 	return true
 }
 
@@ -235,22 +375,42 @@ func mutatePods(ar v1beta1.AdmissionReview) (_ *v1beta1.AdmissionResponse, track
 			if selector.Matches(labels.Set(pod.Labels)) {
 				glog.V(2).Infof("Using secret %s to inject AppInsights iKey into pod %s.%s (selector nr %d matches)",
 					secret.Name, ar.Request.Namespace, podName, lsi)
-				return createPatchResponse(pod, podName, si), true
+				return createPatchResponse(pod, podName, secret), true
 			}
 		}
+	}
+
+	// TODO: need a better way to check if cluster secret is there or not
+	if aiClusterSecret.InstrumentationKey != "" {
+		return createPatchResponse(pod, podName, aiClusterSecret), true
 	}
 
 	glog.V(2).Infof("No matching secrets found for pod %s.%s, allowing unchanged", ar.Request.Namespace, podName)
 	return &AllowUnchanged, false
 }
 
-func createPatchResponse(pod corev1.Pod, podName string, secretIndex int) *v1beta1.AdmissionResponse {
+func createPatchResponse(pod corev1.Pod, podName string, secret appInsightsSecret) *v1beta1.AdmissionResponse {
 	response := v1beta1.AdmissionResponse{}
 	response.Allowed = true
-	patchList := ""
+	patchList := getPatches(pod, podName, secret)
+
+	if len(patchList) > 0 {
+		patchStr := "[\n" + strings.Join(patchList, ",\n ") + "\n]"
+		glog.V(2).Infof("Patching request for pod %s is: %s", podName, patchStr)
+		response.Patch = []byte(patchStr)
+		pt := v1beta1.PatchTypeJSONPatch
+		response.PatchType = &pt
+	} else {
+		glog.V(2).Infof("None of the containers inside pod %s required patching to add instrumentation key variable", podName)
+	}
+
+	return &response
+}
+
+func getPatches(pod corev1.Pod, podName string, secret appInsightsSecret) []string {
+	patchList := []string{}
 
 	for containerIndex, container := range pod.Spec.Containers {
-
 		// Make sure we do not patch if the AppInsights instrumentation key is already set on the pod
 		iKeyVarExists := false
 		for _, envVar := range container.Env {
@@ -267,28 +427,59 @@ func createPatchResponse(pod corev1.Pod, podName string, secretIndex int) *v1bet
 			continue
 		}
 
-		if len(patchList) > 0 {
-			patchList += ",\n"
-		}
-
 		if len(container.Env) > 0 {
-			patchList += fmt.Sprintf(addIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
+			// TODO: better way to discriminate or inject cluster level ikey vs app level ikey
+			if secret.InstrumentationKey != "" {
+				patchList = append(patchList, fmt.Sprintf(addIKeyPlainTextPatch, containerIndex, secret.InstrumentationKey))
+			} else {
+				patchList = append(patchList, fmt.Sprintf(addIKeyFromSecretPatch, containerIndex, secret.Name))
+			}
 		} else {
-			patchList += fmt.Sprintf(addEnvWithIKeyVarPatch, containerIndex, aiSecrets[secretIndex].Name)
+			if secret.InstrumentationKey != "" {
+				patchList = append(patchList, fmt.Sprintf(addEnvWithIKeyPlainTextPatch, containerIndex, secret.InstrumentationKey))
+			} else {
+				patchList = append(patchList, fmt.Sprintf(addEnvWithIKeyFromSecretPatch, containerIndex, secret.Name))
+			}
+		}
+
+		// TODO: Will need different endpoint if there are multiple containers, thus sidecars
+		if containerIndex > 0 {
+			continue
+		}
+
+		// Add AppInsights_Endpoint environment variable
+		endpointVarExists := false
+		for endpointEnvIndex, envVar := range container.Env {
+			if envVar.Name == EndpointVarName {
+				glog.V(2).Infof(
+					"Container %s of pod %s already has an instrumentation key variable, skipping",
+					container.Name, podName)
+				patchList = append(patchList, fmt.Sprintf(updateEndpointPatch, containerIndex, endpointEnvIndex, EndpointVarValue))
+				endpointVarExists = true
+				break
+			}
+		}
+		if !endpointVarExists {
+			patchList = append(patchList, fmt.Sprintf(addEndpointPatch, containerIndex, EndpointVarValue))
+		}
+
+		// Add side car container
+		// TODO: For demo purpose, only inject the sidecar if there isn't a sidecar already and only inject for the first container
+		volumeMountName := "tmp"
+		for _, mount := range container.VolumeMounts {
+			if mount.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" {
+				volumeMountName = mount.Name
+				break
+			}
+		}
+		if secret.InstrumentationKey != "" {
+			patchList = append(patchList, fmt.Sprintf(addFluentdSidecarPlainTextIKeyPatch, secret.InstrumentationKey, container.Name, volumeMountName))
+		} else {
+			patchList = append(patchList, fmt.Sprintf(addFluentdSidecarIKeyFromSecretPatch, secret.Name, container.Name))
 		}
 	}
 
-	if len(patchList) > 0 {
-		patchStr := "[\n" + patchList + "\n]"
-		glog.V(2).Infof("Patching request for pod %s is: %s", podName, patchStr)
-		response.Patch = []byte(patchStr)
-		pt := v1beta1.PatchTypeJSONPatch
-		response.PatchType = &pt
-	} else {
-		glog.V(2).Infof("None of the containers inside pod %s required patching to add instrumentation key variable", podName)
-	}
-
-	return &response
+	return patchList
 }
 
 func serve(w http.ResponseWriter, r *http.Request, admit admitFunc) {
@@ -375,15 +566,20 @@ func refreshSecrets() error {
 	defer aiSecretsLock.Unlock()
 
 	for _, secret := range secrets.Items {
-		if secret.Namespace == KubeSystemNamespace {
-			continue
+		if secret.Namespace == KubeSystemNamespace && secret.Name == AppInsightsClusterResource {
+			aiClusterSecret.Name = secret.Name
+			aiClusterSecret.Namespace = secret.Namespace
+			aiClusterSecret.CreationTimestamp = secret.CreationTimestamp
+			// The secret data is already decoded
+			aiClusterSecret.InstrumentationKey = string(secret.Data[IKeyVarName])
+			glog.V(2).Infof("Adding cluster AI resource Secret %s", secret.Name)
+		} else {
+			ais, err := toAppInsightsSecretInfo(secret)
+			if err != nil || ais == nil {
+				continue
+			}
+			newSecrets = append(newSecrets, *ais)
 		}
-
-		ais, err := toAppInsightsSecretInfo(secret)
-		if err != nil || ais == nil {
-			continue
-		}
-		newSecrets = append(newSecrets, *ais)
 	}
 
 	sort.Sort(byCreationTimestamp(newSecrets))

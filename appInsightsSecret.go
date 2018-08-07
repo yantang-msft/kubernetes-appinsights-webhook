@@ -23,6 +23,9 @@ type appInsightsSecret struct {
 	Name              string
 	Namespace         string
 	CreationTimestamp metav1.Time
+	// TODO: Find a better way to store and inject the ikey explicitly in the yaml file.
+	// The reason we use it here is because the cluster AI resource secret is stored in the kube-system namespace, which can't be referenced from other namespaces
+	InstrumentationKey string
 }
 
 type byCreationTimestamp []appInsightsSecret
