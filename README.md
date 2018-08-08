@@ -13,6 +13,7 @@ into the pod, using environment variables. It works in a way similar to PodPrese
 Places to update to accomodate your own environment
 1) The REPO variable in the make file
 2) The image variable in k8s/ai-webhook/values.yaml
+3) The image name defined in main.go, which is the image of the fluentd sidecar that is being injected. Search for addFluentdSidecarPlainTextIKeyPatch
 
 # Build
 
