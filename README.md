@@ -9,7 +9,12 @@ matching the same label selector.
 When such pod is being created, the webhook will inject all keys from the secret
 into the pod, using environment variables. It works in a way similar to PodPreset.
 
-# Build 
+# Configure
+Places to update to accomodate your own environment
+1) The REPO variable in the make file
+2) The image variable in k8s/ai-webhook/values.yaml
+
+# Build
 
     go get // (only before first build)
     make
